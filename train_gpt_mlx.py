@@ -2,7 +2,7 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
 """
 from __future__ import annotations
 
@@ -35,8 +35,8 @@ COMPUTE_DTYPE = mx.bfloat16
 # ==============================================================================
 # HYPERPARAMETERS
 # ==============================================================================
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
+# Default riskier starter run:
+# - 10 transformer blocks at width 480
 # - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
@@ -52,6 +52,7 @@ class Hyperparameters:
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_max_seqs: int = int(os.environ.get("VAL_MAX_SEQS", 0))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
@@ -59,18 +60,14 @@ class Hyperparameters:
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
-    # Force MLX to materialize the graph after every sub-batch, preventing lazy
-    # graph buildup across accumulation steps. Keeps peak memory low on 16GB machines.
-    # Disable on 32GB+ unified memory for better throughput (MLX_EAGER_EVAL=0).
-    mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
-    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1600))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
-    model_dim: int = int(os.environ.get("MODEL_DIM", 512))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 10))
+    model_dim: int = int(os.environ.get("MODEL_DIM", 480))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
@@ -79,20 +76,22 @@ class Hyperparameters:
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
-    qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.3))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
     adam_eps: float = float(os.environ.get("ADAM_EPS", 1e-8))
-    tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.05))
-    matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.04))
+    tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.045))
+    matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.035))
+    scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.03))
     muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps: int = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_beta: float = float(os.environ.get("EMA_BETA", 0.998))
+    ema_start_step: int = int(os.environ.get("EMA_START_STEP", 200))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -552,11 +551,15 @@ MX_DTYPE_FROM_NAME = {
     "bfloat16": mx.bfloat16,
 }
 
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+INT8_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT8_KEEP_FLOAT_MAX_NUMEL", 65_536))
 INT8_KEEP_FLOAT_STORE_DTYPE = np.float16
 INT8_PER_ROW_SCALE_DTYPE = np.float16
+INT8_OFFSET_DTYPE = np.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT8_ASYM_BLEND = float(os.environ.get("INT8_ASYM_BLEND", 0.0))
+INT8_ASYM_CENTER_PERCENTILE = float(os.environ.get("INT8_ASYM_CENTER_PERCENTILE", 99.0))
+INT8_ASYM_CENTER_Q = INT8_ASYM_CENTER_PERCENTILE / 100.0
 
 
 def _np_float32(arr: mx.array) -> np.ndarray:
@@ -572,27 +575,75 @@ def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str
     return np.ascontiguousarray(np.array(arr, copy=True))
 
 
-def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
+def clone_flat_state_for_ema(flat_state: dict[str, mx.array]) -> dict[str, mx.array]:
+    ema_state: dict[str, mx.array] = {}
+    for name, arr in flat_state.items():
+        ema_state[name] = arr.astype(mx.float32) if mx.issubdtype(arr.dtype, mx.floating) else arr
+    return ema_state
+
+
+def update_ema_flat_state_(ema_state: dict[str, mx.array], flat_state: dict[str, mx.array], beta: float) -> None:
+    one_minus_beta = 1.0 - beta
+    for name, arr in flat_state.items():
+        if mx.issubdtype(arr.dtype, mx.floating):
+            ema_state[name] = ema_state[name] * beta + arr.astype(mx.float32) * one_minus_beta
+        else:
+            ema_state[name] = arr
+
+
+def materialize_ema_flat_state(
+    ema_state: dict[str, mx.array],
+    reference_flat_state: dict[str, mx.array],
+) -> dict[str, mx.array]:
+    out: dict[str, mx.array] = {}
+    for name, ref in reference_flat_state.items():
+        src = ema_state[name]
+        out[name] = src.astype(ref.dtype) if mx.issubdtype(ref.dtype, mx.floating) else src
+    return out
+
+
+def blended_quant_center(f32: np.ndarray, axis: int | None = None) -> np.ndarray:
+    mean = np.mean(f32, axis=axis, dtype=np.float32) if axis is not None else np.array(float(np.mean(f32, dtype=np.float32)) if f32.size else 0.0, dtype=np.float32)
+    if INT8_ASYM_BLEND <= 0.0 or not f32.size:
+        return mean
+    lo_q = 1.0 - INT8_ASYM_CENTER_Q
+    lo = np.quantile(f32, lo_q, axis=axis)
+    hi = np.quantile(f32, INT8_ASYM_CENTER_Q, axis=axis)
+    robust_mid = (lo + hi) * 0.5
+    blend = min(max(INT8_ASYM_BLEND, 0.0), 1.0)
+    return np.asarray(mean + (robust_mid - mean) * blend, dtype=np.float32)
+
+
+def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     f32 = _np_float32(arr)
     if f32.ndim == 2:
+        offset = blended_quant_center(f32, axis=1)
+        centered = f32 - offset[:, None]
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
-        clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
-        clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
+        clip_abs = np.quantile(np.abs(centered), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
+        clipped = np.clip(centered, -clip_abs[:, None], clip_abs[:, None])
         scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
         q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
-        return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
+        return (
+            np.ascontiguousarray(q),
+            np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False)),
+            np.ascontiguousarray(offset.astype(INT8_OFFSET_DTYPE, copy=False)),
+        )
 
     # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
+    offset = blended_quant_center(f32)
+    centered = f32 - offset
+    clip_abs = float(np.quantile(np.abs(centered).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
     scale = np.array(clip_abs / 127.0 if clip_abs > 0.0 else 1.0, dtype=np.float32)
-    q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
-    return np.ascontiguousarray(q), scale
+    q = np.clip(np.round(np.clip(centered, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
+    return np.ascontiguousarray(q), scale, np.ascontiguousarray(offset.astype(INT8_OFFSET_DTYPE, copy=False))
 
 
 def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str, object], dict[str, int]]:
     quantized: dict[str, np.ndarray] = {}
     scales: dict[str, np.ndarray] = {}
+    offsets: dict[str, np.ndarray] = {}
     dtypes: dict[str, str] = {}
     passthrough: dict[str, np.ndarray] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
@@ -620,17 +671,21 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_array(arr)
+        q, s, o = quantize_float_array(arr)
         if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+            qmeta[name] = {"scheme": "per_row_affine", "axis": 0}
+        else:
+            qmeta[name] = {"scheme": "per_tensor_affine"}
         quantized[name] = q
         scales[name] = s
+        offsets[name] = o
         dtypes[name] = str(arr.dtype).split(".")[-1]
-        stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes)
+        stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes + o.nbytes)
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "int8_affine_per_row_v2",
         "quantized": quantized,
         "scales": scales,
+        "offsets": offsets,
         "dtypes": dtypes,
         "passthrough": passthrough,
     }
@@ -644,16 +699,22 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
 def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.array]:
     out: dict[str, mx.array] = {}
     qmeta = quant_obj.get("qmeta", {})
+    offsets = quant_obj.get("offsets", {})
     passthrough_orig_dtypes = quant_obj.get("passthrough_orig_dtypes", {})
     for name, q in quant_obj["quantized"].items():
         q_np = np.asarray(q, dtype=np.int8)
         dtype_name = quant_obj["dtypes"][name]
         scale = np.asarray(quant_obj["scales"][name], dtype=np.float32)
-        if qmeta.get(name, {}).get("scheme") == "per_row" or scale.ndim > 0:
+        offset = np.asarray(offsets[name], dtype=np.float32) if name in offsets else None
+        if qmeta.get(name, {}).get("scheme") == "per_row_affine" or scale.ndim > 0:
             # Broadcast the saved row scale back across trailing dimensions.
             out_arr = q_np.astype(np.float32) * scale.reshape((q_np.shape[0],) + (1,) * (q_np.ndim - 1))
+            if offset is not None:
+                out_arr = out_arr + offset.reshape((q_np.shape[0],) + (1,) * (q_np.ndim - 1))
         else:
             out_arr = q_np.astype(np.float32) * float(scale)
+            if offset is not None:
+                out_arr = out_arr + float(offset)
         out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[dtype_name])
     for name, arr in quant_obj["passthrough"].items():
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
@@ -753,8 +814,6 @@ def loss_and_grad_chunked(
         scale = float(y.size) / total_tokens
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
-        if args.mlx_eager_eval:
-            mx.eval(loss_value, grad_accum)  # materialize each chunk to cap peak memory
     return loss_value, tree_unflatten(list(grad_accum.items()))
 
 
@@ -765,7 +824,6 @@ def eval_val(
     base_bytes_lut: np.ndarray,
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
-    log_fn: Callable[[str], None] | None = None,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -779,11 +837,12 @@ def eval_val(
         )
     val_batch_seqs = val_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.size - 1) // args.train_seq_len
-    total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
-    total_loss_sum = 0.0
+    if args.val_max_seqs > 0:
+        total_seqs = min(total_seqs, args.val_max_seqs)
+    total_loss = mx.array(0.0, dtype=mx.float32)
     total_tokens = 0.0
     total_bytes = 0.0
-    for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
+    for batch_seq_start in range(0, total_seqs, val_batch_seqs):
         batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
         raw_start = batch_seq_start * args.train_seq_len
         raw_end = batch_seq_end * args.train_seq_len + 1
@@ -793,9 +852,7 @@ def eval_val(
         x = mx.array(x_np, dtype=mx.int32)
         y = mx.array(y_np, dtype=mx.int32)
         chunk_token_count = float(y.size)
-        batch_loss = compiled_loss(x, y).astype(mx.float32)
-        mx.eval(batch_loss)
-        total_loss_sum += float(batch_loss.item()) * chunk_token_count
+        total_loss = total_loss + compiled_loss(x, y).astype(mx.float32) * chunk_token_count
         prev_ids = x_np.reshape(-1)
         tgt_ids = y_np.reshape(-1)
         bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
@@ -804,11 +861,9 @@ def eval_val(
         ).astype(np.int16, copy=False)
         total_tokens += chunk_token_count
         total_bytes += float(bytes_np.astype(np.float64).sum())
-        if log_fn is not None and total_batches > 1 and (
-            batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
-        ):
-            log_fn(f"val_progress:{batch_idx}/{total_batches}")
-    val_loss = total_loss_sum / total_tokens
+    total_loss = total_loss / total_tokens
+    mx.eval(total_loss)
+    val_loss = float(total_loss.item())
     bits_per_token = val_loss / math.log(2.0)
     val_bpb = bits_per_token * (total_tokens / total_bytes)
     return val_loss, val_bpb
@@ -931,6 +986,8 @@ def main() -> None:
     else:
         log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
     log(f"tokenizer_path:{args.tokenizer_path}")
+    if args.val_max_seqs > 0:
+        log(f"WARNING: val_loader:subset val_max_seqs:{args.val_max_seqs}")
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
@@ -951,11 +1008,16 @@ def main() -> None:
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
+    if args.ema_beta > 0.0:
+        log(f"final_weight_ema:enabled beta:{args.ema_beta} start_step:{args.ema_start_step}")
+    else:
+        log("final_weight_ema:disabled")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
+    ema_state = clone_flat_state_for_ema(dict(tree_flatten(model.state))) if args.ema_beta > 0.0 and args.ema_start_step <= 0 else None
 
     # ==============================================================================
     # TRAINING LOOP
@@ -994,6 +1056,7 @@ def main() -> None:
         mx.synchronize()
 
         train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+        ema_state = clone_flat_state_for_ema(dict(tree_flatten(model.state))) if args.ema_beta > 0.0 and args.ema_start_step <= 0 else None
 
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
@@ -1003,7 +1066,6 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-            train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
                 args,
@@ -1012,8 +1074,8 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
-                log_fn=log,
             )
+            train_time_ms += 1000.0 * (time.perf_counter() - t0)
             if step % 25 == 0 or last_step:
                 log(
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1035,13 +1097,19 @@ def main() -> None:
             loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
             accum = accumulate_flat_grads(accum, grads, grad_scale)
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
-            if args.mlx_eager_eval:
-                mx.eval(train_loss, accum)  # materialize each microbatch to cap peak memory
 
         grads = tree_unflatten(list(accum.items()))
         grads = clip_grad_tree(grads, args.grad_clip_norm)
         train_loss_value = float(train_loss.item())
         opt.step(model, grads, step=step, lr_mul=lr_mul)
+        if args.ema_beta > 0.0:
+            current_flat_state = dict(tree_flatten(model.state))
+            if ema_state is None and step + 1 >= args.ema_start_step:
+                ema_state = clone_flat_state_for_ema(current_flat_state)
+                mx.eval(*ema_state.values())
+            elif ema_state is not None:
+                update_ema_flat_state_(ema_state, current_flat_state, args.ema_beta)
+                mx.eval(*ema_state.values())
         mx.synchronize()
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
@@ -1062,8 +1130,15 @@ def main() -> None:
     # We always write a raw artifact and a quantized artifact, then validate the
     # quantized roundtrip directly by loading the dequantized tensors back into the
     # model and running one final validation pass.
-    out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
+    if ema_state is not None:
+        model.update(tree_unflatten(list(materialize_ema_flat_state(ema_state, flat_state).items())))
+        flat_state = {k: v for k, v in tree_flatten(model.state)}
+        log("final_weights:ema")
+    else:
+        log("final_weights:last_step")
+
+    out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
@@ -1093,7 +1168,6 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
-        log_fn=log,
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
