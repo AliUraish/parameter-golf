@@ -62,6 +62,7 @@ class Hyperparameters:
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1600))
+    warmdown_frac: float = float(os.environ.get("WARMDOWN_FRAC", 0.0))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model (defaults match the current baseline setup).
@@ -71,6 +72,8 @@ class Hyperparameters:
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    mlp_hidden: int = int(os.environ.get("MLP_HIDDEN", 0))
+    mlp_leaky_slope: float = float(os.environ.get("MLP_LEAKY_SLOPE", 0.0))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -108,6 +111,10 @@ class Hyperparameters:
         return self.train_batch_tokens // self.grad_accum_steps
 
     def lr_mul(self, step: int, elapsed_ms: float) -> float:
+        if self.max_wallclock_seconds > 0 and self.warmdown_frac > 0.0:
+            warmdown_ms = 1000.0 * self.max_wallclock_seconds * min(max(self.warmdown_frac, 0.0), 1.0)
+            remaining_ms = max(1000.0 * self.max_wallclock_seconds - elapsed_ms, 0.0)
+            return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
         if self.warmdown_iters <= 0:
             return 1.0
         if self.max_wallclock_seconds <= 0:
@@ -339,14 +346,16 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, mlp_hidden: int = 0, mlp_leaky_slope: float = 0.0):
         super().__init__()
-        hidden = dim * mlp_mult
+        hidden = mlp_hidden if mlp_hidden > 0 else dim * mlp_mult
         self.fc = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
+        self.mlp_leaky_slope = mlp_leaky_slope
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
+        x = self.fc(x)
+        x = mx.maximum(x, self.mlp_leaky_slope * x) if self.mlp_leaky_slope > 0.0 else nn.relu(x)
         return self.proj(x * x)
 
 
@@ -357,6 +366,8 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        mlp_hidden: int,
+        mlp_leaky_slope: float,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -364,7 +375,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, mlp_hidden, mlp_leaky_slope)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -384,6 +395,7 @@ class GPT(nn.Module):
     # - decoder half consumes reversed skips with learned skip_weights
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 mlp_hidden: int, mlp_leaky_slope: float,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float):
         super().__init__()
@@ -398,7 +410,7 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, mlp_hidden, mlp_leaky_slope, rope_base, qk_gain_init)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -553,6 +565,7 @@ MX_DTYPE_FROM_NAME = {
 
 INT8_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT8_KEEP_FLOAT_MAX_NUMEL", 65_536))
 INT8_KEEP_FLOAT_STORE_DTYPE = np.float16
+FP16_EMBED_EXPORT = bool(int(os.environ.get("FP16_EMBED_EXPORT", "1")))
 INT8_PER_ROW_SCALE_DTYPE = np.float16
 INT8_OFFSET_DTYPE = np.float16
 INT8_CLIP_PERCENTILE = 99.99984
@@ -660,6 +673,12 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = np.ascontiguousarray(np.array(arr))
             stats["int8_payload_bytes"] += int(passthrough[name].nbytes)
+            continue
+
+        if FP16_EMBED_EXPORT and name == "tok_emb.weight":
+            kept = keep_float_array(name, arr, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += int(kept.nbytes)
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
@@ -947,6 +966,8 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        mlp_hidden=args.mlp_hidden,
+        mlp_leaky_slope=args.mlp_leaky_slope,
         logit_chunk_tokens=args.logit_chunk_tokens,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import glob
+import inspect
 import io
 import json
 import math
@@ -27,6 +28,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+try:
+    SDPA_SUPPORTS_ENABLE_GQA = "enable_gqa" in inspect.signature(F.scaled_dot_product_attention).parameters
+except (TypeError, ValueError):
+    SDPA_SUPPORTS_ENABLE_GQA = "enable_gqa" in str(getattr(F.scaled_dot_product_attention, "__text_signature__", ""))
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -55,6 +61,7 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1600))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.0))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -68,6 +75,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 480))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_hidden = int(os.environ.get("MLP_HIDDEN", 0))
+    mlp_leaky_slope = float(os.environ.get("MLP_LEAKY_SLOPE", 0.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -346,6 +355,7 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 )
 INT8_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT8_KEEP_FLOAT_MAX_NUMEL", 65_536))
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+FP16_EMBED_EXPORT = bool(int(os.environ.get("FP16_EMBED_EXPORT", "1")))
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_OFFSET_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
@@ -464,6 +474,12 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
             stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        if FP16_EMBED_EXPORT and name == "tok_emb.weight":
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
@@ -701,29 +717,31 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if self.num_kv_heads != self.num_heads and not SDPA_SUPPORTS_ENABLE_GQA:
+            kv_repeat = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(kv_repeat, dim=1)
+            v = v.repeat_interleave(kv_repeat, dim=1)
+        sdpa_kwargs: dict[str, object] = {"attn_mask": None, "is_causal": True}
+        if SDPA_SUPPORTS_ENABLE_GQA:
+            sdpa_kwargs["enable_gqa"] = self.num_kv_heads != self.num_heads
+        y = F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, mlp_hidden: int = 0, mlp_leaky_slope: float = 0.0):
         super().__init__()
-        hidden = mlp_mult * dim
+        hidden = mlp_hidden if mlp_hidden > 0 else mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.mlp_leaky_slope = mlp_leaky_slope
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = self.fc(x)
+        x = F.leaky_relu(x, negative_slope=self.mlp_leaky_slope) if self.mlp_leaky_slope > 0.0 else torch.relu(x)
         return self.proj(x.square())
 
 
@@ -734,6 +752,8 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        mlp_hidden: int,
+        mlp_leaky_slope: float,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -741,7 +761,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, mlp_hidden, mlp_leaky_slope)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -764,6 +784,8 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        mlp_hidden: int,
+        mlp_leaky_slope: float,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -788,6 +810,8 @@ class GPT(nn.Module):
                     num_heads,
                     num_kv_heads,
                     mlp_mult,
+                    mlp_hidden,
+                    mlp_leaky_slope,
                     rope_base,
                     qk_gain_init,
                 )
@@ -953,6 +977,8 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        mlp_hidden=args.mlp_hidden,
+        mlp_leaky_slope=args.mlp_leaky_slope,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -1050,6 +1076,10 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        if max_wallclock_ms is not None and args.warmdown_frac > 0.0:
+            warmdown_ms = max_wallclock_ms * min(max(args.warmdown_frac, 0.0), 1.0)
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
