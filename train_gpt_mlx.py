@@ -356,8 +356,9 @@ class CausalSelfAttention(nn.Module):
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         if self.use_xsa:
             bsz, num_heads, seqlen, head_dim = y.shape
-            group = num_heads // self.num_kv_heads
-            y_grouped = y.reshape(bsz, self.num_kv_heads, group, seqlen, head_dim)
+            num_value_heads = v.shape[1]
+            group = num_heads // num_value_heads
+            y_grouped = y.reshape(bsz, num_value_heads, group, seqlen, head_dim)
             v_norm = v / mx.maximum(mx.sqrt(mx.sum(v * v, axis=-1, keepdims=True)), 1e-6)
             v_norm = mx.expand_dims(v_norm, axis=2)
             proj = mx.sum(y_grouped * v_norm, axis=-1, keepdims=True) * v_norm
