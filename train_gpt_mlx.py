@@ -74,6 +74,7 @@ class Hyperparameters:
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
     mlp_hidden: int = int(os.environ.get("MLP_HIDDEN", 0))
     mlp_leaky_slope: float = float(os.environ.get("MLP_LEAKY_SLOPE", 0.0))
+    xsa_last_n: int = int(os.environ.get("XSA_LAST_N", 0))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_dims: int = int(os.environ.get("ROPE_DIMS", 0))
     ln_scale: bool = bool(int(os.environ.get("LN_SCALE", "0")))
@@ -335,6 +336,7 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(f"rope_dims must be even and <= head_dim, got rope_dims={rope_dims}, head_dim={self.head_dim}")
         self.rope = nn.RoPE(self.rope_dims, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
+        self.use_xsa = False
 
     def _apply_rope(self, x: mx.array) -> mx.array:
         x_rot = self.rope(x[..., :self.rope_dims])
@@ -352,6 +354,14 @@ class CausalSelfAttention(nn.Module):
         k = self._apply_rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
+        if self.use_xsa:
+            bsz, num_heads, seqlen, head_dim = y.shape
+            group = num_heads // self.num_kv_heads
+            y_grouped = y.reshape(bsz, self.num_kv_heads, group, seqlen, head_dim)
+            v_norm = v / mx.maximum(mx.sqrt(mx.sum(v * v, axis=-1, keepdims=True)), 1e-6)
+            v_norm = mx.expand_dims(v_norm, axis=2)
+            proj = mx.sum(y_grouped * v_norm, axis=-1, keepdims=True) * v_norm
+            y = (y_grouped - proj).reshape(bsz, num_heads, seqlen, head_dim)
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -412,7 +422,7 @@ class GPT(nn.Module):
     # - decoder half consumes reversed skips with learned skip_weights
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 mlp_hidden: int, mlp_leaky_slope: float, rope_dims: int, ln_scale: bool,
+                 mlp_hidden: int, mlp_leaky_slope: float, xsa_last_n: int, rope_dims: int, ln_scale: bool,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float):
         super().__init__()
@@ -430,6 +440,9 @@ class GPT(nn.Module):
             Block(dim, num_heads, num_kv_heads, mlp_mult, mlp_hidden, mlp_leaky_slope, i, ln_scale, rope_dims, rope_base, qk_gain_init)
             for i in range(num_layers)
         ]
+        if xsa_last_n > 0:
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
@@ -985,6 +998,7 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         mlp_hidden=args.mlp_hidden,
         mlp_leaky_slope=args.mlp_leaky_slope,
+        xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
         logit_chunk_tokens=args.logit_chunk_tokens,

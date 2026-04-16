@@ -77,6 +77,7 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     mlp_hidden = int(os.environ.get("MLP_HIDDEN", 0))
     mlp_leaky_slope = float(os.environ.get("MLP_LEAKY_SLOPE", 0.0))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_dims = int(os.environ.get("ROPE_DIMS", 0))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
@@ -716,6 +717,7 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base, rope_dims=rope_dims)
+        self.use_xsa = False
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -736,6 +738,13 @@ class CausalSelfAttention(nn.Module):
         if SDPA_SUPPORTS_ENABLE_GQA:
             sdpa_kwargs["enable_gqa"] = self.num_kv_heads != self.num_heads
         y = F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
+        if self.use_xsa:
+            bsz, num_heads, seqlen, head_dim = y.shape
+            group = num_heads // self.num_kv_heads
+            y_grouped = y.reshape(bsz, self.num_kv_heads, group, seqlen, head_dim)
+            v_norm = F.normalize(v, dim=-1).unsqueeze(2)
+            proj = (y_grouped * v_norm).sum(dim=-1, keepdim=True) * v_norm
+            y = (y_grouped - proj).reshape(bsz, num_heads, seqlen, head_dim)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -802,6 +811,7 @@ class GPT(nn.Module):
         mlp_mult: int,
         mlp_hidden: int,
         mlp_leaky_slope: float,
+        xsa_last_n: int,
         tie_embeddings: bool,
         rope_dims: int,
         ln_scale: bool,
@@ -839,6 +849,9 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        if xsa_last_n > 0:
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1000,6 +1013,7 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         mlp_hidden=args.mlp_hidden,
         mlp_leaky_slope=args.mlp_leaky_slope,
+        xsa_last_n=args.xsa_last_n,
         tie_embeddings=args.tie_embeddings,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
