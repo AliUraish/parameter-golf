@@ -75,6 +75,8 @@ class Hyperparameters:
     mlp_hidden: int = int(os.environ.get("MLP_HIDDEN", 0))
     mlp_leaky_slope: float = float(os.environ.get("MLP_LEAKY_SLOPE", 0.0))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    rope_dims: int = int(os.environ.get("ROPE_DIMS", 0))
+    ln_scale: bool = bool(int(os.environ.get("LN_SCALE", "0")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -308,6 +310,7 @@ class CausalSelfAttention(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
+        rope_dims: int,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -327,8 +330,17 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim)
         self.proj = CastedLinear(dim, dim)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
-        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+        self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
+        if self.rope_dims % 2 != 0 or self.rope_dims > self.head_dim:
+            raise ValueError(f"rope_dims must be even and <= head_dim, got rope_dims={rope_dims}, head_dim={self.head_dim}")
+        self.rope = nn.RoPE(self.rope_dims, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
+
+    def _apply_rope(self, x: mx.array) -> mx.array:
+        x_rot = self.rope(x[..., :self.rope_dims])
+        if self.rope_dims == self.head_dim:
+            return x_rot
+        return mx.concatenate([x_rot, x[..., self.rope_dims:]], axis=-1)
 
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, dim = x.shape
@@ -336,8 +348,8 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
-        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
+        q = self._apply_rope(rms_norm(q).astype(COMPUTE_DTYPE))
+        k = self._apply_rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
@@ -368,24 +380,29 @@ class Block(nn.Module):
         mlp_mult: int,
         mlp_hidden: int,
         mlp_leaky_slope: float,
+        layer_idx: int,
+        ln_scale: bool,
+        rope_dims: int,
         rope_base: float,
         qk_gain_init: float,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_dims, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult, mlp_hidden, mlp_leaky_slope)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        scaled = self.ln_scale_factor
+        attn_out = self.attn(self.attn_norm(x) * scaled)
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * scaled)
         return x
 
 
@@ -395,7 +412,7 @@ class GPT(nn.Module):
     # - decoder half consumes reversed skips with learned skip_weights
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 mlp_hidden: int, mlp_leaky_slope: float,
+                 mlp_hidden: int, mlp_leaky_slope: float, rope_dims: int, ln_scale: bool,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float):
         super().__init__()
@@ -410,7 +427,7 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, mlp_hidden, mlp_leaky_slope, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, mlp_hidden, mlp_leaky_slope, i, ln_scale, rope_dims, rope_base, qk_gain_init)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -968,6 +985,8 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         mlp_hidden=args.mlp_hidden,
         mlp_leaky_slope=args.mlp_leaky_slope,
+        rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
         logit_chunk_tokens=args.logit_chunk_tokens,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,

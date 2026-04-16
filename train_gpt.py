@@ -78,6 +78,8 @@ class Hyperparameters:
     mlp_hidden = int(os.environ.get("MLP_HIDDEN", 0))
     mlp_leaky_slope = float(os.environ.get("MLP_LEAKY_SLOPE", 0.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 0))
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
@@ -649,9 +651,13 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
-    def __init__(self, dim: int, base: float = 10000.0):
+    def __init__(self, dim: int, base: float = 10000.0, rope_dims: int = 0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        rotary_dim = rope_dims if rope_dims > 0 else dim
+        if rotary_dim % 2 != 0 or rotary_dim > dim:
+            raise ValueError(f"rope_dims must be even and <= head_dim, got rope_dims={rope_dims}, head_dim={dim}")
+        self.rotary_dim = rotary_dim
+        inv_freq = 1.0 / (base ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
@@ -673,9 +679,13 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    rotary_dim = cos.size(-1) * 2
+    x_rot = x[..., :rotary_dim]
+    x_pass = x[..., rotary_dim:]
+    half = rotary_dim // 2
+    x1, x2 = x_rot[..., :half], x_rot[..., half:]
+    rotated = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    return torch.cat((rotated, x_pass), dim=-1) if x_pass.numel() else rotated
 
 
 class CausalSelfAttention(nn.Module):
@@ -684,6 +694,7 @@ class CausalSelfAttention(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
+        rope_dims: int,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -704,7 +715,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base, rope_dims=rope_dims)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -754,24 +765,29 @@ class Block(nn.Module):
         mlp_mult: int,
         mlp_hidden: int,
         mlp_leaky_slope: float,
+        layer_idx: int,
+        ln_scale: bool,
+        rope_dims: int,
         rope_base: float,
         qk_gain_init: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_dims, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult, mlp_hidden, mlp_leaky_slope)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        scaled = self.ln_scale_factor
+        attn_out = self.attn(self.attn_norm(x) * scaled)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * scaled)
         return x
 
 
@@ -787,6 +803,8 @@ class GPT(nn.Module):
         mlp_hidden: int,
         mlp_leaky_slope: float,
         tie_embeddings: bool,
+        rope_dims: int,
+        ln_scale: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
@@ -812,6 +830,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     mlp_hidden,
                     mlp_leaky_slope,
+                    i,
+                    ln_scale,
+                    rope_dims,
                     rope_base,
                     qk_gain_init,
                 )
@@ -980,6 +1001,8 @@ def main() -> None:
         mlp_hidden=args.mlp_hidden,
         mlp_leaky_slope=args.mlp_leaky_slope,
         tie_embeddings=args.tie_embeddings,
+        rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
