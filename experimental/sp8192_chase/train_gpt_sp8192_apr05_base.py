@@ -21,7 +21,10 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor, nn
 
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+except Exception:
+    flash_attn_3_func = None
 
 # ----------------------------------------
 # Hyperparameters
@@ -389,6 +392,7 @@ class CausalSelfAttention(nn.Module):
         self.rope_dims = 0
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=train_seq_len)
         self.use_xsa = False
+        self.use_flash_attn_3 = flash_attn_3_func is not None
 
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         B, T, H, D = y.shape
@@ -410,7 +414,22 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        use_flash = (
+            self.use_flash_attn_3
+            and x.is_cuda
+            and torch.cuda.get_device_capability(x.device)[0] == 9
+        )
+        if use_flash:
+            y = flash_attn_3_func(q, k, v, causal=True)
+        else:
+            q_sdpa = q.transpose(1, 2)
+            k_sdpa = k.transpose(1, 2)
+            v_sdpa = v.transpose(1, 2)
+            if self.num_kv_heads != self.num_heads:
+                kv_repeat = self.num_heads // self.num_kv_heads
+                k_sdpa = k_sdpa.repeat_interleave(kv_repeat, dim=1)
+                v_sdpa = v_sdpa.repeat_interleave(kv_repeat, dim=1)
+            y = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True).transpose(1, 2)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
