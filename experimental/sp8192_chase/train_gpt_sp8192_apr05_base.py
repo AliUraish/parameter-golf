@@ -44,6 +44,7 @@ class Hyperparameters():
     train_seq_len = int(os.environ.get('TRAIN_SEQ_LEN', 2048))
     train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 500))
     max_wallclock_seconds = float(os.environ.get('MAX_WALLCLOCK_SECONDS', 600.0))
+    use_torch_compile = os.environ.get('USE_TORCH_COMPILE', 'auto')
 
     # Validation/Evals
     val_batch_tokens = int(os.environ.get('VAL_BATCH_TOKENS', 2048 * 32 * 8))
@@ -149,6 +150,23 @@ def log(msg, console: bool = True) -> None:
         if _logger_hparams.logfile is not None:
             with open(_logger_hparams.logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
+
+
+def should_use_torch_compile(h: Hyperparameters, device: torch.device) -> bool:
+    mode = str(h.use_torch_compile).lower()
+    if mode in {"0", "false", "no"}:
+        return False
+    if mode in {"1", "true", "yes"}:
+        return True
+    if device.type != "cuda":
+        return False
+    return torch.cuda.get_device_capability(device)[0] == 9
+
+
+def maybe_compile(obj, h: Hyperparameters, device: torch.device):
+    if should_use_torch_compile(h, device):
+        return torch.compile(obj, dynamic=False, fullgraph=True)
+    return obj
 
 # ----------------------------------------
 # Data Loading
@@ -1097,7 +1115,7 @@ def eval_val_sliding(
     batch_seqs: int = 32
 ) -> tuple[float, float]:
     base_model.eval()
-    logits_fn = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    logits_fn = maybe_compile(base_model.forward_logits, h, device)
 
     seq_len = h.eval_seq_len
     context_size = seq_len - h.eval_stride
@@ -1181,7 +1199,7 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     # Set up model
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = maybe_compile(base_model, h, device)
     if h.distributed:
         model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False)
     else:
@@ -1363,7 +1381,7 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     if h.num_loops > 0:
         eval_model.looping_active = True
 
-    compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    compiled_model = maybe_compile(eval_model, h, device)
     timed_eval("quantized", eval_val, h, device, val_data, compiled_model)
     if h.sliding_window_enabled:
         timed_eval("quantized_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
@@ -1400,6 +1418,7 @@ def main():
 
     h = Hyperparameters()
     set_logging_hparams(h)
+    log(f"use_torch_compile: {should_use_torch_compile(h, device)}", console=True)
     if h.is_main_process:
         os.makedirs("logs", exist_ok=True)
         log(100 * "=", console=False)
