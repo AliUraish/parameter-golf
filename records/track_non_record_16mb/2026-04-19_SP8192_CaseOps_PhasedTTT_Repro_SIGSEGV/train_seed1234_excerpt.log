@@ -1,0 +1,56 @@
+4838/20000 val_loss: 2.3423 val_bpb: 1.0703
+stopping_early: wallclock_cap train_time: 596196ms step: 4838/20000
+peak memory allocated: 40217 MiB reserved: 44256 MiB
+ema:applying EMA weights
+diagnostic pre-quantization post-ema val_loss:2.34142176 val_bpb:1.06986890 eval_time:10379ms
+Serialized model: 135409136 bytes
+Code size (uncompressed): 125673 bytes
+Code size (compressed): 28315 bytes
+GPTQ:collecting Hessians from calibration data...
+GPTQ:collected 67 Hessians in 3.9s
+Quantized weights:
+  gptq (int6): blocks.attn.c_k.weight, blocks.attn.c_q.weight, blocks.attn.c_v.weight, blocks.attn.proj.weight, blocks.mlp.fc.weight, blocks.mlp.proj.weight
+  gptq (int7): tok_emb.weight
+  passthrough (float16): blocks.attn.q_gain, blocks.attn_scale, blocks.mlp_scale, blocks.resid_mix, parallel_post_lambdas, parallel_resid_lambdas, skip_gates, skip_weights
+Serialized model quantized+brotli: 15911592 bytes
+Total submission size quantized+brotli: 15939907 bytes
+W0419 21:03:18.193000 3255 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 3323 closing signal SIGTERM
+W0419 21:03:18.197000 3255 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 3324 closing signal SIGTERM
+W0419 21:03:18.199000 3255 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 3326 closing signal SIGTERM
+W0419 21:03:18.202000 3255 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 3327 closing signal SIGTERM
+W0419 21:03:18.205000 3255 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 3328 closing signal SIGTERM
+W0419 21:03:18.206000 3255 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 3329 closing signal SIGTERM
+W0419 21:03:18.208000 3255 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 3330 closing signal SIGTERM
+E0419 21:03:45.778000 3255 torch/distributed/elastic/multiprocessing/api.py:874] failed (exitcode: -11) local_rank: 2 (pid: 3325) of binary: /usr/local/bin/python
+Traceback (most recent call last):
+  File "/usr/local/bin/torchrun", line 7, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 901, in main
+    run(args)
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 892, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 143, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 277, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError:
+======================================================
+train_gpt.py FAILED
+------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-04-19_21:03:18
+  host      : f46f44ee6dd8
+  rank      : 2 (local_rank: 2)
+  exitcode  : -11 (pid: 3325)
+  error_file: <N/A>
+  traceback : Signal 11 (SIGSEGV) received by PID 3325
+======================================================
